@@ -1,0 +1,125 @@
+class PortfolioEnv(gym.Env):
+    def __init__(self, prices, features, initial_balance=10000, window_size=10):
+        super(PortfolioEnv, self).__init__()
+        
+        self.prices = prices
+        self.features = features
+        self.initial_balance = initial_balance
+        self.window_size = window_size
+        self.assets = prices.columns.tolist()
+        self.n_assets = len(self.assets)
+        
+        # Action Space: 0=Hold, 1-4=Buy 10%, 5-8=Sell 10%
+        self.action_space = spaces.Discrete(1 + 2 * self.n_assets)
+        
+        # Observation Space: (Window_Size, Features)
+        self.input_dims = (2 * self.n_assets) + (1 + self.n_assets) + self.n_assets + 2
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.window_size, self.input_dims), dtype=np.float32)
+        
+        self.state_memory = deque(maxlen=self.window_size)
+        
+        self.current_step = 0
+        self.max_steps = len(features) - 1
+        
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        
+        self.current_step = 0
+        self.balance = self.initial_balance
+        self.holdings = np.zeros(self.n_assets)
+        self.avg_buy_price = np.zeros(self.n_assets)
+        self.portfolio_value = self.initial_balance
+        self.portfolio_history = [self.initial_balance]
+        self.weight_history = []
+        
+        # Domain Randomization (Allow override for Test)
+        if options and 'risk_aversion' in options:
+            self.risk_aversion = options['risk_aversion']
+        else:
+            self.risk_aversion = np.random.uniform(0, 0.2)
+            
+        if options and 'time_horizon' in options:
+            self.time_horizon = options['time_horizon']
+        else:
+            self.time_horizon = np.random.uniform(0, 1)
+        
+        self.state_memory.clear()
+        initial_state = self._get_single_day_features()
+        for _ in range(self.window_size):
+            self.state_memory.append(initial_state)
+            
+        return np.array(self.state_memory), {}
+    
+    def _get_single_day_features(self):
+        market_data = self.features.iloc[self.current_step].values
+        current_prices = self.prices.iloc[self.current_step].values
+        asset_values = self.holdings * current_prices
+        total_value = self.balance + np.sum(asset_values)
+        
+        weights = np.concatenate(([self.balance], asset_values)) / total_value
+        
+        price_ratios = np.zeros(self.n_assets)
+        for i in range(self.n_assets):
+            if self.avg_buy_price[i] > 0:
+                price_ratios[i] = current_prices[i] / self.avg_buy_price[i]
+            else:
+                price_ratios[i] = 1.0
+                
+        context = np.array([self.risk_aversion, self.time_horizon])
+        
+        state = np.concatenate((market_data, weights, price_ratios, context))
+        return state.astype(np.float32)
+    
+    def step(self, action):
+        current_prices = self.prices.iloc[self.current_step].values
+        
+        # Execute Action
+        if action > 0:
+            asset_idx = (action - 1) % self.n_assets
+            is_buy = (action - 1) < self.n_assets
+            
+            if is_buy:
+                total_value = self.balance + np.sum(self.holdings * current_prices)
+                trade_amount = 0.1 * total_value
+                if self.balance >= trade_amount:
+                    shares = trade_amount / current_prices[asset_idx]
+                    total_cost = (self.holdings[asset_idx] * self.avg_buy_price[asset_idx]) + trade_amount
+                    self.holdings[asset_idx] += shares
+                    self.avg_buy_price[asset_idx] = total_cost / self.holdings[asset_idx]
+                    self.balance -= trade_amount
+            else:
+                if self.holdings[asset_idx] > 0:
+                    shares_to_sell = 0.1 * self.holdings[asset_idx]
+                    self.holdings[asset_idx] -= shares_to_sell
+                    self.balance += shares_to_sell * current_prices[asset_idx]
+                    if self.holdings[asset_idx] < 1e-6:
+                        self.holdings[asset_idx] = 0
+                        self.avg_buy_price[asset_idx] = 0
+        
+        self.current_step += 1
+        terminated = self.current_step >= self.max_steps
+        truncated = False
+        
+        new_prices = self.prices.iloc[self.current_step].values
+        new_total_value = self.balance + np.sum(self.holdings * new_prices)
+        
+        prev_total_value = self.portfolio_history[-1]
+        daily_ret = (new_total_value - prev_total_value) / prev_total_value
+        
+        current_vols = self.features.iloc[self.current_step][[c for c in self.features.columns if '_vol' in c]].values
+        asset_weights = (self.holdings * new_prices) / new_total_value
+        portfolio_vol_proxy = np.sum(asset_weights * current_vols)
+        
+        raw_reward = (daily_ret - (self.risk_aversion * portfolio_vol_proxy * 0.01)) * 20
+        reward = np.clip(raw_reward, -1, 1) # CLIPPING
+        
+        self.portfolio_history.append(new_total_value)
+        self.weight_history.append(np.concatenate(([self.balance], self.holdings * new_prices)) / new_total_value)
+        
+        next_state_features = self._get_single_day_features()
+        self.state_memory.append(next_state_features)
+        
+        return np.array(self.state_memory), reward, terminated, truncated, {}
+        
+    def render(self):
+        pass
